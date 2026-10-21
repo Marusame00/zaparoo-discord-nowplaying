@@ -181,11 +181,19 @@ class DiscordIPC:
         return buf
 
 
+LARGE_IMAGE_KEY = "mister"
+LARGE_IMAGE_TEXT = "MiSTer FPGA"
+
+
 def build_activity(info):
     return {
         "details": f"{info['system']} · {info['game']}" if info["system"] else info["game"],
         "state": "on MiSTer",
         "timestamps": {"start": int(info["started"])},
+        "assets": {
+            "large_image": LARGE_IMAGE_KEY,
+            "large_text": LARGE_IMAGE_TEXT,
+        },
     }
 
 
