@@ -13,6 +13,11 @@ This is a status on your own profile, not a channel message. There is no bot, no
 webhook, and nothing posted anywhere. It only updates a field that is already part
 of your Discord account (your current activity).
 
+> **AI disclosure:** This project's code, docs, and the linked Discord Application's
+> description/tags were written with the help of an AI coding assistant. Testing
+> against real Zaparoo/Discord instances was done, but review the code yourself
+> before trusting it with your own setup.
+
 ## Is this for you?
 
 - You want friends to see what you are playing on MiSTer without you doing anything
