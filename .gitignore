@@ -1,0 +1,6 @@
+# Live secrets (Discord webhook URL)
+config.json
+
+# Python
+__pycache__/
+*.pyc
