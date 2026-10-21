@@ -1,4 +1,4 @@
 {
   "zaparoo_host": "http://192.168.0.14:7497",
-  "discord_webhook_url": "https://discord.com/api/webhooks/<ID>/<TOKEN>"
+  "discord_client_id": "<YOUR_DISCORD_APPLICATION_ID>"
 }

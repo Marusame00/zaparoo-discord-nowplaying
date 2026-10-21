@@ -1,50 +1,62 @@
 # zaparoo-discord-nowplaying
 
-Posts a Discord message whenever the game running on your MiSTer changes.
+Shows the game you are playing on your MiSTer as your **Discord status** (Rich
+Presence), using Zaparoo Core for the game data.
 
-It reads the game state from **Zaparoo Core**, which runs on the MiSTer and
-exposes an API on your local network (default port `7497`). The script:
+```
+Playing MiSTer                      <- Discord application name
+Playstation · Final Fantasy Viii    <- details
+on MiSTer                           <- state (elapsed timer shown)
+```
 
-1. Asks Zaparoo what is running right now (`media.active`). This is not posted, so you
-   only get messages for changes.
-2. Listens to Zaparoo's event stream (`/api/v0.1/events`) for `media.started` and
-   `media.stopped`, and posts each change to a Discord webhook.
+Nothing is posted to a channel. No webhook, server, or bot is needed. Your status
+updates when the game changes and clears when it stops.
 
-Nothing is installed on the MiSTer. There is no SSH and no login on the MiSTer. The
-script only reads from Zaparoo's HTTP API.
+## How it works
+
+1. Asks Zaparoo Core on the MiSTer what is running (`media.active`). It asks again on
+   every reconnect.
+2. Follows Zaparoo's event stream (`/api/v0.1/events`) for `media.started` and
+   `media.stopped`.
+3. Sends the change to the Discord desktop app on this PC over its local IPC pipe.
+
+The MiSTer is not modified. There is no SSH and no login on the MiSTer.
 
 ## Requirements
 
-- Zaparoo Core running on the MiSTer, with its config at `Y:\zaparoo\config.toml`.
-- Python 3.8+ on a PC on the same LAN. No pip packages are needed.
-- A Discord channel webhook.
+- Zaparoo Core running on the MiSTer.
+- Windows PC on the same LAN, with the **Discord desktop app open**. Discord ignores
+  status from a closed app.
+- Python 3.8+. No pip packages.
 
 ## Setup
 
 ### 1. Allow your PC in Zaparoo
 
-Zaparoo rejects remote API requests by default with `remote access disabled for this
-transport` (HTTP 403). Add your PC's LAN IP to `[service]` in `config.toml`:
+Zaparoo rejects remote API requests by default (`403 remote access disabled for this
+transport`). Add your PC's LAN IP under `[service]` in `Y:\zaparoo\config.toml`:
 
 ```toml
 [service]
-api_port = 7497
 allowed_ips = ["192.168.0.11"]   # the PC that runs this script
 ```
 
-Restart the Zaparoo service after editing. Hot reload did not pick up the change in
-testing. On the MiSTer you can restart it from the Scripts menu (`zaparoo`), or
-reboot the MiSTer.
+Restart Zaparoo afterwards. Hot reload did not pick up the change during testing. You
+can restart it from the MiSTer Scripts menu (`zaparoo`) or reboot.
 
-Check that it works from the PC. This should return JSON, not 403:
+Check from the PC. You should get JSON back, not 403:
 
 ```
 curl -X POST http://<mister-ip>:7497/api/v0.1 -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"method\":\"media.active\",\"id\":1}"
 ```
 
-### 2. Create a Discord webhook
+### 2. Create a Discord application
 
-Channel settings -> Integrations -> Webhooks -> New Webhook -> Copy Webhook URL.
+1. Go to https://discord.com/developers/applications and click **New Application**.
+2. Name it **MiSTer**. This is the word after "Playing" on your status.
+3. On **General Information**, copy the **Application ID**. This is your client ID.
+
+You can change the name later from the same page.
 
 ### 3. Configure
 
@@ -55,11 +67,10 @@ copy config.example.json config.json
 Edit `config.json`:
 
 - `zaparoo_host`: `http://<mister-ip>:7497`
-- `discord_webhook_url`: the webhook URL from step 2
+- `discord_client_id`: the Application ID from step 2
 
-`config.json` is git-ignored because it holds a live webhook secret. Do not commit
-it. You can also set the `ZAPAROO_HOST` and `DISCORD_WEBHOOK_URL` environment
-variables instead of using the file.
+`config.json` is git-ignored. The environment variables `ZAPAROO_HOST` and
+`DISCORD_CLIENT_ID` also work.
 
 ### 4. Run
 
@@ -67,22 +78,25 @@ variables instead of using the file.
 python zaparoo_discord_nowplaying.py
 ```
 
-Leave it running. It reconnects automatically if the MiSTer reboots or the network
-drops. To run it at login on Windows, add a shortcut to `shell:startup`.
+Leave it running. It reconnects if Discord restarts, the MiSTer reboots, or the network
+drops. To run it at login, put a shortcut to it in `shell:startup`.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
-| `403 remote access disabled for this transport` | Your PC's IP is not in `allowed_ips`, or Zaparoo was not restarted. |
-| `connection lost ... retrying` in a loop | Wrong IP or port, or the MiSTer is off. Open `http://<mister-ip>:7497/app/` in a browser to check. |
-| Nothing posts when you change games | Confirm the `[event]` lines appear in the console. Check the webhook URL is correct. |
+| `Discord is not running or IPC unavailable` | Start the Discord desktop app. |
+| `Discord closed the IPC pipe` right after connecting | The client ID is wrong or not from your application. |
+| `403 remote access disabled` | Your PC's IP is not in `allowed_ips`, or Zaparoo was not restarted. |
+| Status does not show | Discord settings -> Activity Privacy -> "Display current activity" must be on. |
 
 ## Limitations
 
-- Only changes made while the script is running are posted. The game that is already
-  running at startup is shown in the console but not posted.
-- The `media.stopped` event is handled, but it has not been seen fire on real
-  hardware yet, so it is not confirmed.
-- Written against Zaparoo Core's API as documented. Check `zaparoo.org/docs/core/api/`
-  if a future Zaparoo release changes the event format.
+- Discord's status header is the **application name**, which is set once per
+  application in the developer portal. It cannot change per game, so it always reads
+  "Playing MiSTer". The per-game part is the details line, which is
+  `system · game`.
+- Only changes made while the script runs are shown. A game already running at startup
+  is shown with the time it started, which is taken from Zaparoo when available.
+- Built against Zaparoo Core's documented API and Discord's IPC protocol. Verify both
+  again if either changes.

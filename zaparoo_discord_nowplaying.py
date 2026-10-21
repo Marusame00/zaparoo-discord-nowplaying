@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
 """
-Posts the game currently running on a MiSTer to a Discord channel.
+Shows the MiSTer game you are playing as your Discord Rich Presence status.
+
+  Discord status:  Playing <Application name>
+                   <details>   e.g. Playstation · Final Fantasy Viii
+                   <state>     e.g. on MiSTer
 
 Data source: Zaparoo Core's local HTTP API on the MiSTer (default port 7497).
-  - On startup it asks Zaparoo what is running right now (JSON-RPC `media.active`).
-  - Then it listens to Zaparoo's event stream (SSE, `/api/v0.1/events`) for
-    `media.started` / `media.stopped` and posts each change to a Discord webhook.
+  - On startup and on every reconnect it asks Zaparoo what is running
+    (JSON-RPC `media.active`).
+  - It then follows `media.started` / `media.stopped` from Zaparoo's event
+    stream (SSE, `/api/v0.1/events`) and updates your status to match.
 
-Nothing is installed on the MiSTer and no login/SSH is used. Zaparoo must allow
-this PC in its config (see README: `allowed_ips` under `[service]`).
-Standard library only; Python 3.8+.
+Output goes to the local Discord desktop app over its IPC named pipe. No channel,
+webhook, or bot is involved. The Discord desktop app must be running on this PC.
+Standard library only; Python 3.8+ on Windows.
 """
 
+import datetime
 import json
 import os
+import re
+import struct
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -29,6 +38,15 @@ RECONNECT_DELAY_SECONDS = 5
 HTTP_TIMEOUT_SECONDS = 10
 API_PATH = "/api/v0.1"
 
+# Discord IPC opcodes
+OP_HANDSHAKE = 0
+OP_FRAME = 1
+OP_CLOSE = 2
+
+DISCORD_PIPES = [rf"\\.\pipe\discord-ipc-{i}" for i in range(10)]
+
+
+# ---------------------------------------------------------------- config
 
 def load_config():
     config = {}
@@ -37,18 +55,20 @@ def load_config():
             config = json.load(f)
 
     host = os.environ.get("ZAPAROO_HOST", config.get("zaparoo_host", "")).rstrip("/")
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL", config.get("discord_webhook_url", ""))
+    client_id = os.environ.get("DISCORD_CLIENT_ID", config.get("discord_client_id", ""))
 
     if not host:
         sys.exit("Missing zaparoo_host (config.json or ZAPAROO_HOST env var)")
-    if not webhook or webhook.startswith("<"):
-        sys.exit("Missing discord_webhook_url (config.json or DISCORD_WEBHOOK_URL env var)")
+    if not client_id or client_id.startswith("<"):
+        sys.exit("Missing discord_client_id (config.json or DISCORD_CLIENT_ID env var)")
 
-    return host, webhook
+    return host, str(client_id)
 
+
+# ---------------------------------------------------------------- Zaparoo
 
 def zaparoo_rpc(host, method):
-    """Single JSON-RPC call to Zaparoo Core. Returns the `result` object or None."""
+    """One JSON-RPC call to Zaparoo Core. Returns the `result` object or None."""
     body = json.dumps({"jsonrpc": "2.0", "method": method, "id": 1}).encode("utf-8")
     req = urllib.request.Request(
         host + API_PATH,
@@ -61,57 +81,130 @@ def zaparoo_rpc(host, method):
     return reply.get("result")
 
 
-def post_to_discord(webhook_url, message):
-    body = json.dumps({"content": message}).encode("utf-8")
-    req = urllib.request.Request(
-        webhook_url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-            resp.read()
-    except urllib.error.HTTPError as e:
-        print(f"[discord] webhook post failed: HTTP {e.code}")
-    except urllib.error.URLError as e:
-        print(f"[discord] webhook post failed: {e}")
-
-
-def game_name(params):
-    return params.get("mediaName") or params.get("name") or params.get("mediaPath") or params.get("path")
-
-
-def format_started(params):
-    name = game_name(params) or "Unknown game"
-    system = params.get("systemName") or params.get("systemId")
-    if system:
-        return f"🎮 Now playing on MiSTer: **{name}** ({system})"
-    return f"🎮 Now playing on MiSTer: **{name}**"
-
-
-def format_stopped(params):
-    name = game_name(params)
-    if name:
-        return f"⏹️ Stopped: **{name}**"
-    return "⏹️ MiSTer game stopped"
-
-
-def seed_current_game(host):
-    """Return the name of whatever Zaparoo reports as active right now, or None."""
-    active = zaparoo_rpc(host, "media.active")
-    if not active:
+def parse_zaparoo_time(text):
+    """Zaparoo sends RFC3339 with nanoseconds; trim to microseconds for Python."""
+    if not text:
         return None
-    return game_name(active)
+    m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(.*)$", text)
+    if not m:
+        return None
+    frac = (m.group(2) or "")[:7]  # "." + up to 6 digits
+    try:
+        dt = datetime.datetime.fromisoformat(m.group(1) + frac + m.group(3))
+    except ValueError:
+        return None
+    return dt.timestamp()
 
 
-def listen(host, webhook_url, last_name):
+def media_info(params):
+    """Normalise a Zaparoo media object into what we show. Returns None if empty."""
+    name = params.get("mediaName") or params.get("name")
+    if not name:
+        return None
+    return {
+        "game": name,
+        "system": params.get("systemName") or params.get("systemId") or "",
+        "started": parse_zaparoo_time(params.get("started")) or time.time(),
+    }
+
+
+def same_game(a, b):
+    return a is not None and b is not None and a["game"] == b["game"] and a["system"] == b["system"]
+
+
+# ---------------------------------------------------------------- Discord IPC
+
+class DiscordIPC:
+    """Minimal client for Discord's local IPC pipe (Windows named pipe)."""
+
+    def __init__(self, client_id):
+        self.client_id = client_id
+        self.pipe = None
+
+    def connect(self):
+        last_error = None
+        for path in DISCORD_PIPES:
+            try:
+                self.pipe = open(path, "r+b", buffering=0)
+                break
+            except OSError as e:
+                last_error = e
+        if self.pipe is None:
+            raise ConnectionError(f"Discord is not running or IPC unavailable ({last_error})")
+
+        self._send(OP_HANDSHAKE, {"v": 1, "client_id": self.client_id})
+        opcode, reply = self._recv()
+        if reply.get("evt") == "ERROR":
+            self.close()
+            raise ConnectionError(f"Discord rejected handshake: {reply.get('data', {}).get('message')}")
+
+    def set_activity(self, activity):
+        self._command("SET_ACTIVITY", {"pid": os.getpid(), "activity": activity})
+
+    def clear_activity(self):
+        self._command("SET_ACTIVITY", {"pid": os.getpid(), "activity": None})
+
+    def close(self):
+        if self.pipe is not None:
+            try:
+                self._send(OP_CLOSE, {})
+            except OSError:
+                pass
+            try:
+                self.pipe.close()
+            finally:
+                self.pipe = None
+
+    def _command(self, cmd, args):
+        self._send(OP_FRAME, {"cmd": cmd, "args": args, "nonce": str(uuid.uuid4())})
+        _, reply = self._recv()
+        if reply.get("evt") == "ERROR":
+            raise ConnectionError(f"Discord {cmd} failed: {reply.get('data', {}).get('message')}")
+
+    def _send(self, opcode, payload):
+        data = json.dumps(payload).encode("utf-8")
+        self.pipe.write(struct.pack("<II", opcode, len(data)) + data)
+
+    def _recv(self):
+        header = self._read_exact(8)
+        opcode, length = struct.unpack("<II", header)
+        body = self._read_exact(length) if length else b""
+        return opcode, json.loads(body) if body else {}
+
+    def _read_exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.pipe.read(n - len(buf))
+            if not chunk:
+                raise ConnectionError("Discord closed the IPC pipe")
+            buf += chunk
+        return buf
+
+
+def build_activity(info):
+    return {
+        "details": f"{info['system']} · {info['game']}" if info["system"] else info["game"],
+        "state": "on MiSTer",
+        "timestamps": {"start": int(info["started"])},
+    }
+
+
+# ---------------------------------------------------------------- main loop
+
+def run_session(host, ipc):
+    """Connect to Zaparoo and follow events until something breaks."""
     url = host + API_PATH + "/events"
-    print(f"[zaparoo] connecting to {url}")
-    req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
+    current = media_info(zaparoo_rpc(host, "media.active") or {})
+    if current:
+        ipc.set_activity(build_activity(current))
+        print(f"[status] {current['system']} · {current['game']}")
+    else:
+        ipc.clear_activity()
+        print("[status] nothing running")
 
+    print(f"[zaparoo] listening on {url}")
+    req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
     with urllib.request.urlopen(req) as resp:
-        print("[zaparoo] connected, listening for media events")
         for raw_line in resp:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line.startswith("data:"):
@@ -128,35 +221,33 @@ def listen(host, webhook_url, last_name):
             params = event.get("params") or {}
 
             if method == "media.started":
-                name = game_name(params)
-                if name == last_name:
-                    continue
-                last_name = name
-                message = format_started(params)
-                print(f"[event] {message}")
-                post_to_discord(webhook_url, message)
+                info = media_info(params)
+                if info and not same_game(info, current):
+                    current = info
+                    ipc.set_activity(build_activity(info))
+                    print(f"[status] {info['system']} · {info['game']}")
             elif method == "media.stopped":
-                last_name = None
-                message = format_stopped(params)
-                print(f"[event] {message}")
-                post_to_discord(webhook_url, message)
+                if current is not None:
+                    current = None
+                    ipc.clear_activity()
+                    print("[status] cleared")
 
 
 def main():
-    host, webhook_url = load_config()
+    host, client_id = load_config()
+    ipc = DiscordIPC(client_id)
     while True:
         try:
-            # Re-seed on every (re)connect so a missed event never leaves us stale.
-            # The seeded game is NOT posted; only later changes are.
-            current = seed_current_game(host)
-            if current:
-                print(f"[zaparoo] currently running: {current} (not posted; waiting for a change)")
-            listen(host, webhook_url, current)
+            ipc.connect()
+            print("[discord] connected")
+            run_session(host, ipc)
         except KeyboardInterrupt:
             print("\nStopping.")
+            ipc.close()
             return
-        except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, OSError) as e:
-            print(f"[zaparoo] connection lost ({e}), retrying in {RECONNECT_DELAY_SECONDS}s")
+        except (ConnectionError, urllib.error.URLError, OSError) as e:
+            print(f"[retry] {e}; retrying in {RECONNECT_DELAY_SECONDS}s")
+            ipc.close()
             time.sleep(RECONNECT_DELAY_SECONDS)
 
 
