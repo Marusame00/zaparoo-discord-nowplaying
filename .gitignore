@@ -4,3 +4,6 @@ config.json
 # Python
 __pycache__/
 *.pyc
+
+# Local run log
+run.log
