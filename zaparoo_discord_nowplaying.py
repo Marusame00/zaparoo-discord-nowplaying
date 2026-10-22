@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+if sys.stdout and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
